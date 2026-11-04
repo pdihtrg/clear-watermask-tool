@@ -4,9 +4,10 @@ const items = [];
 let busy = false, toastTimer;
 function toast(message) { $('toast').textContent = message; $('toast').style.display = 'block'; clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').style.display = 'none', 4500); }
 function settings() {
+  const format = $('format').value;
   const limit = Number($('limit').value);
-  if (!Number.isInteger(limit) || limit < 256 || limit > 16384) throw Error('Giới hạn cạnh phải từ 256 đến 16384 px.');
-  return {scale:Number($('scale').value), limit, white:$('background').value === 'white', clean:$('clean').checked, words:$('keywords').value.split('\n').map(s => s.trim().toLowerCase()).filter(Boolean)};
+  if (format === 'png' && (!Number.isInteger(limit) || limit < 256 || limit > 16384)) throw Error('Giới hạn cạnh phải từ 256 đến 16384 px.');
+  return {format, scale:Number($('scale').value), limit, white:$('background').value === 'white', clean:$('clean').checked, words:$('keywords').value.split('\n').map(s => s.trim().toLowerCase()).filter(Boolean)};
 }
 function cleanSVG(source, options) {
   if (/<!DOCTYPE|<!ENTITY/i.test(source)) throw Error('SVG chứa DTD/ENTITY không được hỗ trợ.');
@@ -44,6 +45,11 @@ async function render(item, options) {
   item.url = null; item.blob = null; item.error = null;
   try {
     const result = cleanSVG(await item.file.text(), options);
+    if (options.format === 'svg') {
+      const blob = new Blob([result.svg], {type:'image/svg+xml;charset=utf-8'});
+      Object.assign(item, result, {blob, format:'svg', url:URL.createObjectURL(blob)});
+      return;
+    }
     const url = URL.createObjectURL(new Blob([result.svg], {type:'image/svg+xml'}));
     try {
       const img = new Image();
@@ -56,7 +62,7 @@ async function render(item, options) {
       const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
       canvas.width = canvas.height = 0;
       if (!blob) throw Error('Không đủ bộ nhớ để xuất PNG. Hãy giảm độ phân giải.');
-      Object.assign(item, result, {blob, url:URL.createObjectURL(blob)});
+      Object.assign(item, result, {blob, format:'png', url:URL.createObjectURL(blob)});
     } finally { URL.revokeObjectURL(url); }
   } catch (error) { item.error = error.message; }
 }
@@ -64,6 +70,7 @@ function download(blob, name) { const url = URL.createObjectURL(blob), a = docum
 function update() {
   $('list').replaceChildren(); $('count').textContent = items.length; $('empty').hidden = items.length > 0;
   $('clear').disabled = $('rerender').disabled = busy || !items.length;
+  $('format').disabled = busy;
   $('downloadAll').disabled = busy || !items.some(i => i.blob);
   $('files').disabled = busy;
   for (const item of items) {
@@ -78,9 +85,9 @@ function update() {
     info.append(name,meta);
     if (item.blob) {
       const actions = document.createElement('div'); actions.className = 'cardactions';
-      const save = document.createElement('button'); save.textContent = 'Tải PNG ↓'; save.onclick = () => download(item.blob,item.name);
-      const copy = document.createElement('button'); copy.className = 'secondary'; copy.textContent = 'Copy ảnh';
-      copy.onclick = async () => { try { if (!navigator.clipboard?.write || !window.ClipboardItem) throw Error('Hãy mở web bằng HTTPS hoặc localhost trên Chrome/Edge để copy ảnh.'); await navigator.clipboard.write([new ClipboardItem({'image/png':item.blob})]); toast('Đã copy ảnh PNG. Dán bằng Ctrl+V.'); } catch (error) { toast(error.name === 'NotAllowedError' ? 'Chưa được cấp quyền clipboard. Bạn có thể tải PNG hoặc cho phép sao chép trong trình duyệt.' : error.message); } };
+      const save = document.createElement('button'); save.textContent = `Tải ${item.format.toUpperCase()} ↓`; save.onclick = () => download(item.blob,item.name);
+      const copy = document.createElement('button'); copy.className = 'secondary'; copy.textContent = item.format === 'png' ? 'Copy ảnh' : 'Copy mã SVG';
+      copy.onclick = async () => { try { if (item.format === 'svg') { await navigator.clipboard.writeText(await item.blob.text()); toast('Đã copy mã SVG.'); } else { if (!navigator.clipboard?.write || !window.ClipboardItem) throw Error('Hãy mở web bằng HTTPS hoặc localhost trên Chrome/Edge để copy ảnh.'); await navigator.clipboard.write([new ClipboardItem({'image/png':item.blob})]); toast('Đã copy ảnh PNG. Dán bằng Ctrl+V.'); } } catch (error) { toast(error.name === 'NotAllowedError' ? 'Chưa được cấp quyền clipboard. Bạn có thể tải file hoặc cho phép sao chép trong trình duyệt.' : error.message); } };
       actions.append(save,copy); info.append(actions);
     }
     card.append(preview,info); $('list').append(card);
@@ -89,7 +96,7 @@ function update() {
 async function process(batch, options) {
   busy = true; update();
   try { for (let n=0;n<batch.length;n++) { $('status').textContent = `Đang xử lý ${n+1}/${batch.length}: ${batch[n].file.name}`; await render(batch[n],options); update(); } }
-  finally { busy = false; update(); const ok = items.filter(i=>i.blob).length; $('status').textContent = `Hoàn tất ${ok}/${items.length} ảnh PNG${ok < items.length ? ' · Xem lỗi tại từng file' : ' · Sẵn sàng tải hoặc copy'}.`; }
+  finally { busy = false; update(); const ok = items.filter(i=>i.blob).length; $('status').textContent = `Hoàn tất ${ok}/${items.length} file ${options.format.toUpperCase()}${ok < items.length ? ' · Xem lỗi tại từng file' : ' · Sẵn sàng tải hoặc copy'}.`; }
 }
 async function addFiles(files) {
   if (busy) return toast('Đợi lượt xử lý hiện tại hoàn tất.');
@@ -97,7 +104,7 @@ async function addFiles(files) {
   const batch = [];
   for (const file of files) {
     if (!/\.svg$/i.test(file.name)) { toast('Chỉ nhận file .svg.'); continue; }
-    const stem = file.name.replace(/\.svg$/i,''), base = stem + '.png'; let name=base, n=2;
+    const stem = file.name.replace(/\.svg$/i,''), ext = options.format, base = `${stem}.${ext}`; let name=base, n=2;
     while (items.some(i=>i.name === name)) name = `${stem}_${n++}.png`;
     const item = {file,name}; items.push(item); batch.push(item);
   }
@@ -111,6 +118,20 @@ $('drop').addEventListener('drop',e=>addFiles([...e.dataTransfer.files]));
 window.addEventListener('dragover',e=>e.preventDefault()); window.addEventListener('drop',e=>e.preventDefault());
 $('clear').onclick = () => { for(const i of items) if(i.url) URL.revokeObjectURL(i.url); items.length=0; update(); $('status').textContent='Đã xoá danh sách. Thêm SVG để bắt đầu.'; };
 $('rerender').onclick = () => { try { const options=settings(); process([...items],options); } catch(e) {toast(e.message);} };
+$('format').onchange = () => {
+  const format = $('format').value;
+  $('scale').disabled = $('limit').disabled = $('background').disabled = format === 'svg';
+  $('formatHint').textContent = format === 'svg' ? 'SVG giữ đường nét sắc khi zoom lớn. Nền trong suốt; nút copy sẽ sao chép mã SVG.' : 'PNG là ảnh raster. Chọn SVG nếu bạn cần zoom lớn.';
+  if (!items.length) return;
+  const options = settings();
+  const used = new Set();
+  for (const item of items) {
+    const stem = item.file.name.replace(/\.svg$/i,''); let name = `${stem}.${format}`, n = 2;
+    while (used.has(name)) name = `${stem}_${n++}.${format}`;
+    item.name = name; used.add(name);
+  }
+  process([...items], options);
+};
 // ZIP STORE uses no compression: PNG is already compressed. No library or server needed.
 function crc32(bytes) { let crc=0xffffffff; for(const byte of bytes) { crc ^= byte; for(let n=0;n<8;n++) crc=(crc>>>1)^((crc&1)?0xedb88320:0); } return (crc^0xffffffff)>>>0; }
 function header(size) { const bytes=new Uint8Array(size); return {bytes,view:new DataView(bytes.buffer)}; }
@@ -125,4 +146,5 @@ async function makeZip(entries) {
   const end=header(22); end.view.setUint32(0,0x06054b50,true); end.view.setUint16(8,entries.length,true); end.view.setUint16(10,entries.length,true); end.view.setUint32(12,centralSize,true); end.view.setUint32(16,offset,true);
   return new Blob([...parts,...central,end.bytes],{type:'application/zip'});
 }
-$('downloadAll').onclick = async () => { $('downloadAll').disabled=true; try { const entries=items.filter(i=>i.blob); if(entries.length>65535) throw Error('Mỗi ZIP hỗ trợ tối đa 65535 ảnh.'); download(await makeZip(entries),'SVG-Studio-PNG.zip'); toast('Đã tạo ZIP chứa toàn bộ PNG thành công.'); } catch(e) {toast(e.message);} finally {update();} };
+$('downloadAll').onclick = async () => { $('downloadAll').disabled=true; try { const entries=items.filter(i=>i.blob); if(entries.length>65535) throw Error('Mỗi ZIP hỗ trợ tối đa 65535 file.'); download(await makeZip(entries),'SVG-Studio-exports.zip'); toast(`Đã tạo ZIP chứa ${entries.length} file ${settings().format.toUpperCase()}.`); } catch(e) {toast(e.message);} finally {update();} };
+$('scale').disabled = $('limit').disabled = $('background').disabled = $('format').value === 'svg';

@@ -6,7 +6,7 @@ function toast(message) { $('toast').textContent = message; $('toast').style.dis
 function settings() {
   const format = $('format').value;
   const limit = Number($('limit').value);
-  if (format === 'png' && (!Number.isInteger(limit) || limit < 256 || limit > 16384)) throw Error('Giới hạn cạnh phải từ 256 đến 16384 px.');
+  if (format !== 'svg' && (!Number.isInteger(limit) || limit < 256 || limit > 16384)) throw Error('Giới hạn cạnh phải từ 256 đến 16384 px.');
   return {format, scale:Number($('scale').value), limit, white:$('background').value === 'white', clean:$('clean').checked, words:$('keywords').value.split('\n').map(s => s.trim().toLowerCase()).filter(Boolean)};
 }
 function cleanSVG(source, options) {
@@ -44,10 +44,11 @@ async function render(item, options) {
   if (item.url) URL.revokeObjectURL(item.url);
   item.url = null; item.blob = null; item.error = null;
   try {
-    const result = cleanSVG(await item.file.text(), options);
+    item.source ??= await item.file.text();
+    const result = cleanSVG(item.source, options);
     if (options.format === 'svg') {
       const blob = new Blob([result.svg], {type:'image/svg+xml;charset=utf-8'});
-      Object.assign(item, result, {blob, format:'svg', url:URL.createObjectURL(blob)});
+      Object.assign(item, result, {blob, copyBlob:null, format:'svg', url:URL.createObjectURL(blob)});
       return;
     }
     const url = URL.createObjectURL(new Blob([result.svg], {type:'image/svg+xml'}));
@@ -57,12 +58,15 @@ async function render(item, options) {
       const canvas = document.createElement('canvas'); canvas.width = result.width; canvas.height = result.height;
       const ctx = canvas.getContext('2d');
       if (!ctx) throw Error('Trình duyệt không hỗ trợ Canvas.');
-      if (options.white) { ctx.fillStyle = '#fff'; ctx.fillRect(0,0,canvas.width,canvas.height); }
+      if (options.white || options.format === 'jpg') { ctx.fillStyle = '#fff'; ctx.fillRect(0,0,canvas.width,canvas.height); }
       ctx.drawImage(img,0,0,canvas.width,canvas.height);
-      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      const mime = options.format === 'jpg' ? 'image/jpeg' : 'image/png';
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, mime, 0.94));
+      const copyBlob = options.format === 'jpg' ? await new Promise(resolve => canvas.toBlob(resolve, 'image/png')) : blob;
       canvas.width = canvas.height = 0;
       if (!blob) throw Error('Không đủ bộ nhớ để xuất PNG. Hãy giảm độ phân giải.');
-      Object.assign(item, result, {blob, format:'png', url:URL.createObjectURL(blob)});
+      if (!copyBlob) throw Error('Không thể tạo ảnh để sao chép.');
+      Object.assign(item, result, {blob, copyBlob, format:options.format, url:URL.createObjectURL(blob)});
     } finally { URL.revokeObjectURL(url); }
   } catch (error) { item.error = error.message; }
 }
@@ -86,12 +90,47 @@ function update() {
     if (item.blob) {
       const actions = document.createElement('div'); actions.className = 'cardactions';
       const save = document.createElement('button'); save.textContent = `Tải ${item.format.toUpperCase()} ↓`; save.onclick = () => download(item.blob,item.name);
-      const copy = document.createElement('button'); copy.className = 'secondary'; copy.textContent = item.format === 'png' ? 'Copy ảnh' : 'Copy mã SVG';
-      copy.onclick = async () => { try { if (item.format === 'svg') { await navigator.clipboard.writeText(await item.blob.text()); toast('Đã copy mã SVG.'); } else { if (!navigator.clipboard?.write || !window.ClipboardItem) throw Error('Hãy mở web bằng HTTPS hoặc localhost trên Chrome/Edge để copy ảnh.'); await navigator.clipboard.write([new ClipboardItem({'image/png':item.blob})]); toast('Đã copy ảnh PNG. Dán bằng Ctrl+V.'); } } catch (error) { toast(error.name === 'NotAllowedError' ? 'Chưa được cấp quyền clipboard. Bạn có thể tải file hoặc cho phép sao chép trong trình duyệt.' : error.message); } };
+      const copy = document.createElement('button'); copy.className = 'secondary'; copy.textContent = item.format === 'svg' ? 'Copy mã SVG' : 'Copy ảnh PNG';
+      copy.onclick = async () => { try { if (item.format === 'svg') { await navigator.clipboard.writeText(await item.blob.text()); toast('Đã copy mã SVG.'); } else { if (!navigator.clipboard?.write || !window.ClipboardItem) throw Error('Hãy mở web bằng HTTPS hoặc localhost trên Chrome/Edge để copy ảnh.'); await navigator.clipboard.write([new ClipboardItem({'image/png':item.copyBlob})]); toast('Đã copy ảnh PNG. Dán bằng Ctrl+V.'); } } catch (error) { toast(error.name === 'NotAllowedError' ? 'Chưa được cấp quyền clipboard. Bạn có thể tải file hoặc cho phép sao chép trong trình duyệt.' : error.message); } };
       actions.append(save,copy); info.append(actions);
     }
-    card.append(preview,info); $('list').append(card);
+    const edit = document.createElement('details'); edit.className = 'element-editor';
+    const summary = document.createElement('summary'); summary.textContent = 'Chọn phần tử cần xoá'; edit.append(summary);
+    edit.addEventListener('toggle', () => { if (edit.open && !edit.dataset.loaded) loadElementChoices(item, edit); });
+    card.append(preview,info,edit); $('list').append(card);
   }
+}
+function elementPath(node) {
+  const path=[];
+  while (node.parentElement) { path.unshift([...node.parentElement.children].indexOf(node)); node=node.parentElement; }
+  return path;
+}
+function loadElementChoices(item, editor) {
+  editor.dataset.loaded='1';
+  const doc=new DOMParser().parseFromString(item.source,'image/svg+xml'), root=doc.documentElement;
+  if (doc.querySelector('parsererror')) { editor.append('Không thể đọc cấu trúc SVG.'); return; }
+  const list=document.createElement('div'); list.className='element-list';
+  for (const node of root.querySelectorAll('*')) {
+    const path=elementPath(node), text=(node.textContent||'').trim().replace(/\s+/g,' ').slice(0,70);
+    const desc=[node.localName,node.id&&`#${node.id}`,node.getAttribute('class')&&`.${node.getAttribute('class')}`,text].filter(Boolean).join(' · ');
+    const label=document.createElement('label'); label.className='element-choice';
+    const check=document.createElement('input'); check.type='checkbox'; check.value=path.join('.');
+    const title=document.createElement('span'); title.textContent=desc; title.title=desc;
+    label.append(check,title); list.append(label);
+  }
+  const remove=document.createElement('button'); remove.className='secondary'; remove.textContent='Xoá phần tử đã chọn';
+  remove.onclick=async()=>{
+    const paths=[...list.querySelectorAll('input:checked')].map(input=>input.value.split('.').map(Number));
+    if (!paths.length) return toast('Hãy chọn ít nhất một phần tử.');
+    const fresh=new DOMParser().parseFromString(item.source,'image/svg+xml'), svg=fresh.documentElement;
+    const nodes=paths.map(path=>path.reduce((parent,index)=>parent?.children[index],svg)).filter(Boolean);
+    const chosen=new Set(nodes);
+    for (const node of nodes) if (![...chosen].some(parent=>parent!==node&&parent.contains(node))) node.remove();
+    item.source=new XMLSerializer().serializeToString(svg);
+    const options=settings();
+    await process([item],options);
+  };
+  editor.append(list,remove);
 }
 async function process(batch, options) {
   busy = true; update();
@@ -105,7 +144,7 @@ async function addFiles(files) {
   for (const file of files) {
     if (!/\.svg$/i.test(file.name)) { toast('Chỉ nhận file .svg.'); continue; }
     const stem = file.name.replace(/\.svg$/i,''), ext = options.format, base = `${stem}.${ext}`; let name=base, n=2;
-    while (items.some(i=>i.name === name)) name = `${stem}_${n++}.png`;
+    while (items.some(i=>i.name === name)) name = `${stem}_${n++}.${ext}`;
     const item = {file,name}; items.push(item); batch.push(item);
   }
   if (batch.length) await process(batch,options);
@@ -121,7 +160,7 @@ $('rerender').onclick = () => { try { const options=settings(); process([...item
 $('format').onchange = () => {
   const format = $('format').value;
   $('scale').disabled = $('limit').disabled = $('background').disabled = format === 'svg';
-  $('formatHint').textContent = format === 'svg' ? 'SVG giữ đường nét sắc khi zoom lớn. Nền trong suốt; nút copy sẽ sao chép mã SVG.' : 'PNG là ảnh raster. Chọn SVG nếu bạn cần zoom lớn.';
+  $('formatHint').textContent = format === 'svg' ? 'SVG giữ đường nét sắc khi zoom lớn. Nền trong suốt; nút copy sẽ sao chép mã SVG.' : format === 'jpg' ? 'JPG luôn có nền trắng. Nút copy vẫn sao chép ảnh PNG.' : 'PNG là ảnh raster. Chọn SVG nếu bạn cần zoom lớn.';
   if (!items.length) return;
   const options = settings();
   const used = new Set();
@@ -132,7 +171,7 @@ $('format').onchange = () => {
   }
   process([...items], options);
 };
-// ZIP STORE uses no compression: PNG is already compressed. No library or server needed.
+// ZIP STORE avoids a library; PNG/JPG payloads are already compressed.
 function crc32(bytes) { let crc=0xffffffff; for(const byte of bytes) { crc ^= byte; for(let n=0;n<8;n++) crc=(crc>>>1)^((crc&1)?0xedb88320:0); } return (crc^0xffffffff)>>>0; }
 function header(size) { const bytes=new Uint8Array(size); return {bytes,view:new DataView(bytes.buffer)}; }
 async function makeZip(entries) {

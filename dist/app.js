@@ -124,8 +124,9 @@ function loadElementChoices(item, editor) {
     if (!paths.length) return toast('Hãy chọn ít nhất một phần tử.');
     const fresh=new DOMParser().parseFromString(item.source,'image/svg+xml'), svg=fresh.documentElement;
     const nodes=paths.map(path=>path.reduce((parent,index)=>parent?.children[index],svg)).filter(Boolean);
-    const chosen=new Set(nodes);
-    for (const node of nodes) if (![...chosen].some(parent=>parent!==node&&parent.contains(node))) node.remove();
+    const chosen=new Set(nodes), removed=nodes.filter(node=>![...chosen].some(parent=>parent!==node&&parent.contains(node)));
+    for (const node of removed) node.remove();
+    item.manualRemoved=(item.manualRemoved||0)+removed.length;
     item.source=new XMLSerializer().serializeToString(svg);
     const options=settings();
     await process([item],options);
